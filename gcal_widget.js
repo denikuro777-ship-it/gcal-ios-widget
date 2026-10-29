@@ -4,7 +4,6 @@
 
 var CONFIG = {
   // ★ 予定の文字サイズ（iOSネイティブベクター文字・ポイント単位）
-  // 1行のみの時: 9.5pt / 2行に分かれる時: 8.5pt でくっきり描画します
   singleLineFontSize: 9.5,
   twoLineFontSize: 8.5,
 
@@ -17,8 +16,8 @@ var CONFIG = {
   // 最大表示段数（2行バーのため3段がベストバランス）
   maxEventRows: 3,
 
-  // レイアウト寸法（iOSネイティブポイント単位：312pt幅）
-  colWidth: 42,
+  // レイアウト寸法（iOSネイティブポイント単位：7列均等配置）
+  colWidth: 44,
   colGap: 3,
   barHeight: 26,
   barGapY: 3,
@@ -48,6 +47,8 @@ var CONFIG = {
   bgColor: "#1E1E20",
   monthTextColor: "#FFFFFF",
   plusColor: "#2ECC71",
+  refreshBtnBg: "#2C2C2E",
+  refreshBtnText: "#AEAEB2",
   dividerColor: "#333336",
   weekdayTextColor: "#8E8E93",
   sundayColor: "#FF453A",
@@ -81,14 +82,13 @@ async function main() {
   const rawEvents = await fetchCalendarEvents(periodStart, periodEnd);
   const layoutData = buildEventLayout(rawEvents, days);
 
-  // iOSネイティブベクター描画（画像圧縮によるぼやけゼロ）
+  // iOSネイティブベクター描画（左右完全均等センタリング＋更新ボタン付き）
   const widget = buildNativeVectorWidget(days, layoutData);
 
   // OSが許す最短サイクル（1分後）で次回更新をリクエスト
   const nextRefresh = new Date(Date.now() + 60 * 1000);
   widget.refreshAfterDate = nextRefresh;
 
-  // アプリ内実行時もウィジェットへのセットを行う
   Script.setWidget(widget);
   if (!config.runsInWidget) {
     await widget.presentMedium();
@@ -257,78 +257,143 @@ function splitIntoTwoLines(str, maxPerLine) {
   if (segments.length <= maxPerLine) {
     return [segments.join("")];
   }
-  const line1 = segments.slice(0, maxPerLine).join("");
-  const line2 = segments.slice(maxPerLine, maxPerLine * 2).join("");
+  const capped = segments.slice(0, maxPerLine * 2);
+  // 2行に分かれる場合もなるべく上下の文字数が均等になる位置（最大 maxPerLine）で分割
+  const splitIdx = Math.min(maxPerLine, Math.ceil(capped.length / 2));
+  const line1 = capped.slice(0, splitIdx).join("");
+  const line2 = capped.slice(splitIdx).join("");
   return [line1, line2];
+}
+
+function getRunScriptUrl() {
+  try {
+    if (typeof URLScheme !== "undefined" && URLScheme.forRunningScript) {
+      return URLScheme.forRunningScript();
+    }
+  } catch (_) {}
+  try {
+    if (typeof Script !== "undefined" && Script.name) {
+      return "scriptable:///run?scriptName=" + encodeURIComponent(Script.name());
+    }
+  } catch (_) {}
+  return "scriptable:///";
 }
 
 function buildNativeVectorWidget(days, { grid }) {
   const widget = new ListWidget();
   widget.backgroundColor = new Color(CONFIG.bgColor);
   widget.url = CONFIG.tapUrl;
-  widget.setPadding(8, 10, 8, 10);
+  widget.setPadding(8, 8, 8, 8);
 
   const colW = CONFIG.colWidth;
   const gapX = CONFIG.colGap;
   const totalWidth = colW * 7 + gapX * 6;
 
-  // 1. ヘッダー行（左: 10月 / 右: ＋）
-  const headerRow = widget.addStack();
+  // 1. ヘッダー行（左: 10月 / 右: ↻更新ボタン ＋ 予定追加ボタン）
+  const headerWrap = widget.addStack();
+  headerWrap.layoutHorizontally();
+  headerWrap.addSpacer();
+
+  const headerRow = headerWrap.addStack();
   headerRow.layoutHorizontally();
   headerRow.centerAlignContent();
   headerRow.size = new Size(totalWidth, 18);
 
   const firstMonth = days[0].getMonth() + 1;
-  const monthTxt = headerRow.addText(`${firstMonth}月`);
+  const monthTxt = headerRow.addText(` ${firstMonth}月`);
   monthTxt.font = Font.boldSystemFont(14);
   monthTxt.textColor = new Color(CONFIG.monthTextColor);
 
   headerRow.addSpacer();
 
-  const plusTxt = headerRow.addText("＋");
+  // ↻ 更新ボタン（タップでScriptableの更新スクリプトを起動）
+  const refreshBtn = headerRow.addStack();
+  refreshBtn.layoutHorizontally();
+  refreshBtn.centerAlignContent();
+  refreshBtn.size = new Size(34, 17);
+  refreshBtn.cornerRadius = 8;
+  refreshBtn.backgroundColor = new Color(CONFIG.refreshBtnBg);
+  refreshBtn.url = getRunScriptUrl();
+  refreshBtn.addSpacer();
+  const refreshTxt = refreshBtn.addText("↻");
+  refreshTxt.font = Font.boldSystemFont(12);
+  refreshTxt.textColor = new Color(CONFIG.refreshBtnText);
+  refreshBtn.addSpacer();
+
+  headerRow.addSpacer(8);
+
+  // ＋ ボタン（Googleカレンダーを開く）
+  const plusBtn = headerRow.addStack();
+  plusBtn.layoutHorizontally();
+  plusBtn.centerAlignContent();
+  plusBtn.size = new Size(22, 17);
+  plusBtn.url = CONFIG.tapUrl;
+  plusBtn.addSpacer();
+  const plusTxt = plusBtn.addText("＋");
   plusTxt.font = Font.mediumSystemFont(15);
   plusTxt.textColor = new Color(CONFIG.plusColor);
+  plusBtn.addSpacer();
+
+  headerWrap.addSpacer();
 
   widget.addSpacer(2);
 
-  // 2. 曜日行（左端＝今日からスライド）
-  const weekdayRow = widget.addStack();
+  // 2. 曜日行（各列の左右にaddSpacerを入れて100%中央揃え）
+  const weekdayWrap = widget.addStack();
+  weekdayWrap.layoutHorizontally();
+  weekdayWrap.addSpacer();
+
+  const weekdayRow = weekdayWrap.addStack();
   weekdayRow.layoutHorizontally();
   weekdayRow.size = new Size(totalWidth, 13);
 
   for (let col = 0; col < 7; col++) {
     const cell = weekdayRow.addStack();
-    cell.size = new Size(colW, 13);
+    cell.layoutHorizontally();
     cell.centerAlignContent();
+    cell.size = new Size(colW, 13);
 
+    cell.addSpacer();
     const dow = days[col].getDay();
     const wTxt = cell.addText(WEEKDAYS_JP[dow]);
     wTxt.font = Font.mediumSystemFont(9.5);
     wTxt.textColor = new Color(CONFIG.weekdayTextColor);
     wTxt.centerAlignText();
+    cell.addSpacer();
 
     if (col < 6) weekdayRow.addSpacer(gapX);
   }
 
+  weekdayWrap.addSpacer();
+
   widget.addSpacer(2);
 
   // 3. 区切り線
-  const divider = widget.addStack();
+  const divWrap = widget.addStack();
+  divWrap.layoutHorizontally();
+  divWrap.addSpacer();
+  const divider = divWrap.addStack();
   divider.size = new Size(totalWidth, 1);
   divider.backgroundColor = new Color(CONFIG.dividerColor);
+  divWrap.addSpacer();
 
   widget.addSpacer(3);
 
-  // 4. 日付行（左端 col=0 は白丸ハイライト、土曜＝青、日曜＝赤）
-  const dateRow = widget.addStack();
+  // 4. 日付行（各列・白丸ともに左右addSpacerで100%中央揃え）
+  const dateWrap = widget.addStack();
+  dateWrap.layoutHorizontally();
+  dateWrap.addSpacer();
+
+  const dateRow = dateWrap.addStack();
   dateRow.layoutHorizontally();
   dateRow.centerAlignContent();
   dateRow.size = new Size(totalWidth, 20);
 
   for (let col = 0; col < 7; col++) {
     const cell = dateRow.addStack();
-    cell.size = new Size(colW, 20);
+    cell.layoutHorizontally();
     cell.centerAlignContent();
+    cell.size = new Size(colW, 20);
 
     const d = days[col];
     const dow = d.getDay();
@@ -343,33 +408,45 @@ function buildNativeVectorWidget(days, { grid }) {
       textColor = CONFIG.todayWeekdayText;
     }
 
+    cell.addSpacer();
     if (isToday) {
       const circle = cell.addStack();
+      circle.layoutHorizontally();
+      circle.centerAlignContent();
       circle.size = new Size(20, 20);
       circle.cornerRadius = 10;
       circle.backgroundColor = new Color(CONFIG.todayCircleColor);
-      circle.centerAlignContent();
 
+      circle.addSpacer();
       const dTxt = circle.addText(String(d.getDate()));
       dTxt.font = Font.boldSystemFont(11);
       dTxt.textColor = new Color(textColor);
       dTxt.centerAlignText();
+      circle.addSpacer();
     } else {
       const dTxt = cell.addText(String(d.getDate()));
       dTxt.font = Font.regularSystemFont(11);
       dTxt.textColor = new Color(textColor);
       dTxt.centerAlignText();
     }
+    cell.addSpacer();
 
     if (col < 6) dateRow.addSpacer(gapX);
   }
 
+  dateWrap.addSpacer();
+
   widget.addSpacer(4);
 
-  // 5. 予定バー行（最大 maxEventRows 段・各バー内は最大2行表示）
+  // 5. 予定バー行（バー内部の上下・左右すべてにaddSpacerを入れて完全中央揃え）
   for (let r = 0; r < CONFIG.maxEventRows; r++) {
     const rowCells = grid[r] || [null, null, null, null, null, null, null];
-    const evRow = widget.addStack();
+
+    const evWrap = widget.addStack();
+    evWrap.layoutHorizontally();
+    evWrap.addSpacer();
+
+    const evRow = evWrap.addStack();
     evRow.layoutHorizontally();
     evRow.centerAlignContent();
     evRow.size = new Size(totalWidth, CONFIG.barHeight);
@@ -388,7 +465,6 @@ function buildNativeVectorWidget(days, { grid }) {
 
         const bar = evRow.addStack();
         bar.layoutVertically();
-        bar.centerAlignContent();
         bar.size = new Size(barW, CONFIG.barHeight);
         bar.backgroundColor = new Color(ev.colorHex);
         bar.cornerRadius = CONFIG.barCornerRadius;
@@ -396,29 +472,32 @@ function buildNativeVectorWidget(days, { grid }) {
 
         const maxPerLine = CONFIG.charsPerColLine * span;
         const lines = splitIntoTwoLines(ev.title, maxPerLine);
+        const fontSize = lines.length === 1 ? CONFIG.singleLineFontSize : CONFIG.twoLineFontSize;
 
-        if (lines.length === 1) {
-          const t1 = bar.addText(lines[0]);
-          t1.font = Font.boldSystemFont(CONFIG.singleLineFontSize);
-          t1.textColor = new Color(CONFIG.eventTextColor);
-          t1.centerAlignText();
-          t1.lineLimit = 1;
-          t1.minimumScaleFactor = 0.8;
-        } else {
-          for (let i = 0; i < 2; i++) {
-            const t = bar.addText(lines[i]);
-            t.font = Font.boldSystemFont(CONFIG.twoLineFontSize);
-            t.textColor = new Color(CONFIG.eventTextColor);
-            t.centerAlignText();
-            t.lineLimit = 1;
-            t.minimumScaleFactor = 0.8;
-          }
+        bar.addSpacer();
+        for (let i = 0; i < lines.length; i++) {
+          const lineRow = bar.addStack();
+          lineRow.layoutHorizontally();
+          lineRow.centerAlignContent();
+          lineRow.addSpacer();
+
+          const t = lineRow.addText(lines[i]);
+          t.font = Font.boldSystemFont(fontSize);
+          t.textColor = new Color(CONFIG.eventTextColor);
+          t.centerAlignText();
+          t.lineLimit = 1;
+          t.minimumScaleFactor = 0.75;
+
+          lineRow.addSpacer();
         }
+        bar.addSpacer();
 
         col += span;
         if (col < 7) evRow.addSpacer(gapX);
       }
     }
+
+    evWrap.addSpacer();
 
     if (r < CONFIG.maxEventRows - 1) {
       widget.addSpacer(CONFIG.barGapY);
