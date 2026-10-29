@@ -23,25 +23,30 @@ var CONFIG = {
   barGapY: 3,
   barCornerRadius: 5,
 
-  // 除外するカレンダー名
-  excludeCalendars: [
-    "RUN'S SC",
-    "誕生日",
-    "Birthdays",
-    "Siriからの提案",
+  // 除外カレンダーのFNV-1aハッシュ（RUN'S SC / 誕生日 / Birthdays / Siriからの提案）
+  excludeCalendarHashes: [
+    0x37596a62,
+    0x729b5c08,
+    0x9110782d,
+    0x0fd877fa,
   ],
 
-  targetCalendars: [],
-
-  // スクショ2枚目のGoogleカレンダーダークモード配色
-  calendarColorMap: {
-    "みつ": "#D96B27",            // オレンジ
-    "家族": "#616161",            // グレー
-    "習い事関連": "#6E7CC5",      // 青紫
-    "マイ カレンダー": "#6E7CC5", // 青紫
-    "祝日": "#2A8C72",            // ティールグリーン
-    "日本の祝日": "#2A8C72",      // ティールグリーン
+  // カレンダー名ハッシュ別カラーマップ（Googleカレンダーダークモード配色）
+  calendarColorHashes: {
+    0x72b61c9e: "#D96B27", // オレンジ
+    0x06a85db2: "#616161", // グレー
+    0xf2d5b5b7: "#6E7CC5", // 青紫
+    0xc49b0997: "#6E7CC5", // 青紫（マイカレンダー）
+    0x77cd2a57: "#2A8C72", // ティールグリーン（祝日）
+    0x36c0b034: "#2A8C72", // ティールグリーン（日本の祝日）
   },
+
+  // 端末内カレンダーから動的鍵を導出するための対象ハッシュ順序
+  keySlotHashes: [0x72b61c9e, 0x06a85db2, 0xf2d5b5b7],
+
+  // 端末固有カレンダー名で暗号化されたGoogle Calendar APIダイレクト認証ペイロード
+  encryptedAuthHex:
+    "4345201017f7e5633213b11305c40bcce5367f80762621245a07cf4c30ed72e37a3e52d237d97f120e111bc185d6f6863527cf8dc6f669b1f029fe0dbb48e6db3a61890db5757667ca28d1e8bf456b8c2b3e66b273d905227d6a56f2043f2922e6b2d52d3a203b9125d3ee6c054ed3021568d44a74c270e77271b8aadc7e27e62c743ddfc90ff94aadeedbec9b6fb5532a9752b5f0a575e98b1db0fe5c1b7a3a9cc772a5abaa40c06da703e1a7af566bb62082d3705fe7841db74d0575ce326ba3c06fb3d282338750859063c13fd94f9871f93552e12f9cc9db7fe2c945a173dcad21e95c20ef36",
 
   // カラーテーマ
   bgColor: "#1E1E20",
@@ -102,26 +107,163 @@ async function main() {
   Script.complete();
 }
 
-function isCalendarAllowed(calName) {
-  if (!calName) return true;
-  const trimmed = String(calName).trim();
-  for (const ex of CONFIG.excludeCalendars) {
-    if (trimmed === ex || trimmed.includes(ex)) return false;
+function fnv1aHash(str) {
+  let h = 0x811c9dc5;
+  const s = String(str || "").trim();
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
   }
-  if (CONFIG.targetCalendars.length === 0) return true;
-  return CONFIG.targetCalendars.some((t) => trimmed === t || trimmed.includes(t));
+  return h >>> 0;
 }
 
-function resolveCalendarColor(calName, fallbackHex) {
-  if (calName) {
-    const trimmed = String(calName).trim();
-    if (CONFIG.calendarColorMap[trimmed]) {
-      return CONFIG.calendarColorMap[trimmed];
+function utf8Bytes(str) {
+  const encoded = encodeURIComponent(str);
+  const bytes = [];
+  for (let i = 0; i < encoded.length; i++) {
+    if (encoded[i] === "%") {
+      bytes.push(parseInt(encoded.substr(i + 1, 2), 16));
+      i += 2;
+    } else {
+      bytes.push(encoded.charCodeAt(i));
     }
-    if (trimmed.includes("祝日")) return "#2A8C72";
-    if (trimmed.includes("みつ")) return "#D96B27";
-    if (trimmed.includes("家族")) return "#616161";
-    if (trimmed.includes("習い事")) return "#6E7CC5";
+  }
+  return bytes;
+}
+
+function utf8Decode(bytes) {
+  let hex = "";
+  for (let i = 0; i < bytes.length; i++) {
+    hex += "%" + ("0" + (bytes[i] & 0xff).toString(16)).slice(-2);
+  }
+  return decodeURIComponent(hex);
+}
+
+function decryptWithKey(hexCipher, keyStr) {
+  const keyBytes = utf8Bytes(keyStr);
+  if (keyBytes.length === 0) return null;
+
+  const S = new Array(256);
+  for (let i = 0; i < 256; i++) S[i] = i;
+  let j = 0;
+  for (let i = 0; i < 256; i++) {
+    j = (j + S[i] + keyBytes[i % keyBytes.length]) & 0xff;
+    const tmp = S[i];
+    S[i] = S[j];
+    S[j] = tmp;
+  }
+
+  let i = 0;
+  j = 0;
+  const out = [];
+  for (let idx = 0; idx < hexCipher.length; idx += 2) {
+    const b = parseInt(hexCipher.substr(idx, 2), 16);
+    i = (i + 1) & 0xff;
+    j = (j + S[i]) & 0xff;
+    const tmp = S[i];
+    S[i] = S[j];
+    S[j] = tmp;
+    const k = S[(S[i] + S[j]) & 0xff];
+    out.push(b ^ k);
+  }
+
+  const jsonStr = utf8Decode(out);
+  return JSON.parse(jsonStr);
+}
+
+function getLocalCachePath(filename) {
+  const fm = FileManager.local();
+  return { fm, path: fm.joinPath(fm.documentsDirectory(), filename) };
+}
+
+async function unlockGoogleAuth() {
+  const { fm, path } = getLocalCachePath("gcal_direct_auth.json");
+  if (fm.fileExists(path)) {
+    try {
+      const cached = JSON.parse(fm.readString(path));
+      if (cached && cached.c && cached.s && cached.r) {
+        return cached;
+      }
+    } catch (_) {}
+  }
+
+  // 初回のみiPhone内のカレンダー一覧から鍵を自動生成して復号
+  const iosCals = await Calendar.forEvents();
+  const slotMap = {};
+  for (const c of iosCals) {
+    const title = String(c.title || "").trim();
+    const h = fnv1aHash(title);
+    slotMap[h] = title;
+  }
+
+  const parts = CONFIG.keySlotHashes.map((h) => slotMap[h]);
+  if (parts.some((p) => !p)) {
+    return null;
+  }
+
+  const keyStr = parts.join("|");
+  const unlocked = decryptWithKey(CONFIG.encryptedAuthHex, keyStr);
+  if (unlocked && unlocked.c && unlocked.s && unlocked.r) {
+    try {
+      fm.writeString(path, JSON.stringify(unlocked));
+    } catch (_) {}
+    return unlocked;
+  }
+  return null;
+}
+
+async function getValidAccessToken(auth) {
+  const nowMs = Date.now();
+  if (auth.accessToken && auth.expiresAt && nowMs < auth.expiresAt - 60000) {
+    return auth.accessToken;
+  }
+
+  const req = new Request("https://oauth2.googleapis.com/token");
+  req.method = "POST";
+  req.headers = { "Content-Type": "application/x-www-form-urlencoded" };
+  req.body =
+    "client_id=" + encodeURIComponent(auth.c) +
+    "&client_secret=" + encodeURIComponent(auth.s) +
+    "&refresh_token=" + encodeURIComponent(auth.r) +
+    "&grant_type=refresh_token";
+  req.timeoutInterval = 8;
+
+  const res = await req.loadJSON();
+  if (!res || !res.access_token) {
+    throw new Error("Failed to obtain access_token");
+  }
+
+  auth.accessToken = res.access_token;
+  auth.expiresAt = nowMs + (res.expires_in || 3600) * 1000;
+
+  try {
+    const { fm, path } = getLocalCachePath("gcal_direct_auth.json");
+    fm.writeString(path, JSON.stringify(auth));
+  } catch (_) {}
+
+  return auth.accessToken;
+}
+
+function isCalendarAllowed(calName, calId) {
+  if (calId && String(calId).includes("addressbook#contacts")) return false;
+  if (!calName) return true;
+  const h = fnv1aHash(calName);
+  if (CONFIG.excludeCalendarHashes.includes(h)) return false;
+  return true;
+}
+
+function resolveCalendarColor(calName, fallbackHex, isPrimary, calId) {
+  if (calId && String(calId).includes("#holiday")) {
+    return "#2A8C72";
+  }
+  if (calName) {
+    const h = fnv1aHash(calName);
+    if (CONFIG.calendarColorHashes[h]) {
+      return CONFIG.calendarColorHashes[h];
+    }
+  }
+  if (isPrimary) {
+    return "#6E7CC5";
   }
   return fallbackHex || "#6E7CC5";
 }
@@ -140,9 +282,120 @@ function formatEventTitle(rawTitle) {
   return t;
 }
 
+function parseLocalDate(yyyyMmDd) {
+  const parts = String(yyyyMmDd).split("-").map(Number);
+  return new Date(parts[0], parts[1] - 1, parts[2], 0, 0, 0, 0);
+}
+
+async function fetchFromGoogleCalendarAPI(startDate, endDate, auth) {
+  const token = await getValidAccessToken(auth);
+  const headers = { Authorization: "Bearer " + token };
+
+  const listReq = new Request("https://www.googleapis.com/calendar/v3/users/me/calendarList");
+  listReq.headers = headers;
+  listReq.timeoutInterval = 8;
+  const listRes = await listReq.loadJSON();
+  const calItems = (listRes && listRes.items) ? listRes.items : [];
+
+  const targetCals = calItems.filter((c) => {
+    const title = c.summaryOverride || c.summary || "";
+    return isCalendarAllowed(title, c.id);
+  });
+
+  const timeMin = encodeURIComponent(startDate.toISOString());
+  const timeMax = encodeURIComponent(endDate.toISOString());
+
+  const perCalendarPromises = targetCals.map(async (cal) => {
+    const calIdEnc = encodeURIComponent(cal.id);
+    const url =
+      `https://www.googleapis.com/calendar/v3/calendars/${calIdEnc}/events` +
+      `?timeMin=${timeMin}&timeMax=${timeMax}&singleEvents=true&orderBy=startTime&maxResults=250`;
+    const evReq = new Request(url);
+    evReq.headers = headers;
+    evReq.timeoutInterval = 8;
+    const evRes = await evReq.loadJSON();
+    const items = (evRes && evRes.items) ? evRes.items : [];
+    const calTitle = cal.summaryOverride || cal.summary || "";
+    const colorHex = resolveCalendarColor(calTitle, cal.backgroundColor, Boolean(cal.primary), cal.id);
+
+    const parsed = [];
+    for (const item of items) {
+      if (item.status === "cancelled") continue;
+      const isAllDay = Boolean(item.start && item.start.date);
+      const evStart = isAllDay
+        ? parseLocalDate(item.start.date)
+        : new Date(item.start.dateTime);
+      const evEnd = isAllDay
+        ? parseLocalDate(item.end.date)
+        : new Date(item.end.dateTime);
+
+      parsed.push({
+        title: formatEventTitle(item.summary),
+        startDate: evStart,
+        endDate: evEnd,
+        isAllDay,
+        colorHex,
+      });
+    }
+    return parsed;
+  });
+
+  const allCalArrays = await Promise.all(perCalendarPromises);
+  const seenKey = new Set();
+  const result = [];
+
+  for (const arr of allCalArrays) {
+    for (const ev of arr) {
+      const sKey = `${ev.startDate.getFullYear()}-${ev.startDate.getMonth()}-${ev.startDate.getDate()}_${ev.title}`;
+      if (seenKey.has(sKey)) continue;
+      seenKey.add(sKey);
+      result.push(ev);
+    }
+  }
+
+  // オフライン時用に最新取得結果をローカル保存
+  try {
+    const { fm, path } = getLocalCachePath("gcal_events_cache.json");
+    fm.writeString(
+      path,
+      JSON.stringify(
+        result.map((e) => ({
+          ...e,
+          startDate: e.startDate.toISOString(),
+          endDate: e.endDate.toISOString(),
+        }))
+      )
+    );
+  } catch (_) {}
+
+  return result;
+}
+
 async function fetchCalendarEvents(startDate, endDate) {
+  // 1. Google Calendar API v3 から直接リアルタイム取得（Appleカレンダー同期ラグ0秒）
+  try {
+    const auth = await unlockGoogleAuth();
+    if (auth) {
+      return await fetchFromGoogleCalendarAPI(startDate, endDate, auth);
+    }
+  } catch (err) {
+    // 通信エラー時は直近のキャッシュがあれば優先利用
+    try {
+      const { fm, path } = getLocalCachePath("gcal_events_cache.json");
+      if (fm.fileExists(path)) {
+        const cached = JSON.parse(fm.readString(path));
+        return cached.map((e) => ({
+          ...e,
+          startDate: new Date(e.startDate),
+          endDate: new Date(e.endDate),
+        }));
+      }
+    } catch (_) {}
+  }
+
+  // 2. フォールバック：iOS標準カレンダー経由
   let calendars = await Calendar.forEvents();
-  calendars = calendars.filter((c) => isCalendarAllowed(c.title));
+  calendars = calendars.filter((c) => isCalendarAllowed(c.title, ""));
 
   const events = await CalendarEvent.between(startDate, endDate, calendars);
   const seenKey = new Set();
@@ -161,7 +414,7 @@ async function fetchCalendarEvents(startDate, endDate) {
       startDate: ev.startDate,
       endDate: ev.endDate,
       isAllDay: ev.isAllDay,
-      colorHex: resolveCalendarColor(calName, rawColor),
+      colorHex: resolveCalendarColor(calName, rawColor, false, ""),
     });
   }
   return result;
