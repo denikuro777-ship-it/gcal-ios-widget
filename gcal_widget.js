@@ -84,12 +84,13 @@ async function main() {
   // iOSネイティブベクター描画（画像圧縮によるぼやけゼロ）
   const widget = buildNativeVectorWidget(days, layoutData);
 
-  const nextRefresh = new Date(Date.now() + 15 * 60 * 1000);
+  // OSが許す最短サイクル（1分後）で次回更新をリクエスト
+  const nextRefresh = new Date(Date.now() + 60 * 1000);
   widget.refreshAfterDate = nextRefresh;
 
-  if (config.runsInWidget) {
-    Script.setWidget(widget);
-  } else {
+  // アプリ内実行時もウィジェットへのセットを行う
+  Script.setWidget(widget);
+  if (!config.runsInWidget) {
     await widget.presentMedium();
   }
   Script.complete();
