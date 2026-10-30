@@ -97,14 +97,12 @@ async function main() {
   widget.refreshAfterDate = nextRefresh;
 
   Script.setWidget(widget);
-  Script.complete();
 
-  // ウィジェットの「↻」タップ時（When Interacting: Run Script）にScriptableが一瞬開いた後、即座にホーム画面へ自動で戻る
-  try {
-    if (typeof App !== "undefined" && App.close) {
-      App.close();
-    }
-  } catch (_) {}
+  // ウィジェットの「↻」タップ時やアプリ内実行時、更新完了後に即座にホーム画面へ自動で戻る
+  if (!config.runsInWidget && typeof App !== "undefined" && App.close) {
+    App.close();
+  }
+  Script.complete();
 }
 
 function fnv1aHash(str) {
@@ -503,10 +501,23 @@ function splitIntoTwoLines(str, maxPerLine) {
   return [line1, line2];
 }
 
+function getRunScriptUrl() {
+  let base = "scriptable:///";
+  try {
+    if (typeof URLScheme !== "undefined" && URLScheme.forRunningScript) {
+      base = URLScheme.forRunningScript();
+    } else if (typeof Script !== "undefined" && Script.name) {
+      base = "scriptable:///run?scriptName=" + encodeURIComponent(Script.name());
+    }
+  } catch (_) {}
+  const sep = base.includes("?") ? "&" : "?";
+  return base + sep + "action=refresh";
+}
+
 function buildNativeVectorWidget(days, { grid }, isDirectApi) {
   const widget = new ListWidget();
   widget.backgroundColor = new Color(CONFIG.bgColor);
-  // ルートwidget.urlは設定しない（↻ボタンタップ時にiOS標準のWhen Interacting: Run Scriptを発火させウィジェット自体を再描画させるため）
+  widget.url = CONFIG.tapUrl;
   widget.setPadding(8, 10, 8, 10);
 
   const colW = CONFIG.colWidth;
@@ -527,13 +538,14 @@ function buildNativeVectorWidget(days, { grid }, isDirectApi) {
 
   headerRow.addSpacer();
 
-  // ↻ 更新ボタン（urlをあえて設定しないことで、タップ時にScriptableウィジェット本体のRun Script更新を発火）
+  // ↻ 更新ボタン（Google API直結時は緑色、タップ時は再取得してApp.close()で即ホーム画面へ戻る）
   const refreshBtn = headerRow.addStack();
   refreshBtn.layoutHorizontally();
   refreshBtn.centerAlignContent();
   refreshBtn.size = new Size(28, 17);
   refreshBtn.cornerRadius = 8;
   refreshBtn.backgroundColor = new Color(CONFIG.refreshBtnBg);
+  refreshBtn.url = getRunScriptUrl();
   const refreshTxt = refreshBtn.addText("↻");
   refreshTxt.font = Font.boldSystemFont(12);
   refreshTxt.textColor = new Color(isDirectApi ? CONFIG.plusColor : CONFIG.refreshBtnText);
