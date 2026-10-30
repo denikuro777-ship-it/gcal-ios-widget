@@ -415,16 +415,32 @@ function formatDateKey(d) {
   return `${y}-${m}-${day}`;
 }
 
-function weatherCodeToEmoji(code) {
-  if (code === undefined || code === null) return "☀️";
+function weatherCodeToSpec(code) {
+  const defaultSpec = { symbol: "sun.max.fill", color: "#FFCC00", fallback: "☀" };
+  if (code === undefined || code === null) return defaultSpec;
   const c = Number(code);
-  if (c === 0 || c === 1) return "☀️";
-  if (c === 2) return "⛅️";
-  if (c === 3 || c === 45 || c === 48) return "☁️";
-  if ((c >= 51 && c <= 63) || c === 80 || c === 81) return "🌧️";
-  if ((c >= 65 && c <= 67) || c === 82 || (c >= 95 && c <= 99)) return "☔️";
-  if ((c >= 71 && c <= 77) || c === 85 || c === 86) return "⛄️";
-  return "☁️";
+  if (c === 0 || c === 1) {
+    return { symbol: "sun.max.fill", color: "#FFCC00", fallback: "☀" };
+  }
+  if (c === 2) {
+    return { symbol: "cloud.sun.fill", color: "#FFD60A", fallback: "⛅" };
+  }
+  if (c === 3 || c === 45 || c === 48) {
+    return { symbol: "cloud.fill", color: "#D1D5DB", fallback: "☁" };
+  }
+  if ((c >= 51 && c <= 63) || c === 80 || c === 81) {
+    return { symbol: "cloud.rain.fill", color: "#38BDF8", fallback: "🌧" };
+  }
+  if ((c >= 65 && c <= 67) || c === 82) {
+    return { symbol: "umbrella.fill", color: "#60A5FA", fallback: "☔" };
+  }
+  if (c >= 95 && c <= 99) {
+    return { symbol: "cloud.bolt.rain.fill", color: "#FACC15", fallback: "⚡" };
+  }
+  if ((c >= 71 && c <= 77) || c === 85 || c === 86) {
+    return { symbol: "snowflake", color: "#E0F2FE", fallback: "❄" };
+  }
+  return { symbol: "cloud.fill", color: "#D1D5DB", fallback: "☁" };
 }
 
 async function getCurrentCoordinates() {
@@ -486,7 +502,8 @@ async function getCurrentCoordinates() {
 }
 
 async function fetchWeeklyWeather(days) {
-  const { fm, path } = getLocalCachePath("gcal_weather_cache.json");
+  const { fm, path } = getLocalCachePath("gcal_weather_cache_v2.json");
+  const defaultSpec = weatherCodeToSpec(0);
   try {
     const coords = await getCurrentCoordinates();
     const url =
@@ -499,23 +516,23 @@ async function fetchWeeklyWeather(days) {
     if (res && res.daily && Array.isArray(res.daily.time) && Array.isArray(res.daily.weather_code)) {
       const weatherMap = {};
       for (let i = 0; i < res.daily.time.length; i++) {
-        weatherMap[res.daily.time[i]] = weatherCodeToEmoji(res.daily.weather_code[i]);
+        weatherMap[res.daily.time[i]] = weatherCodeToSpec(res.daily.weather_code[i]);
       }
       try {
         fm.writeString(path, JSON.stringify(weatherMap));
       } catch (_) {}
-      return days.map((d) => weatherMap[formatDateKey(d)] || "☀️");
+      return days.map((d) => weatherMap[formatDateKey(d)] || defaultSpec);
     }
   } catch (_) {}
 
   try {
     if (fm.fileExists(path)) {
       const cachedMap = JSON.parse(fm.readString(path));
-      return days.map((d) => cachedMap[formatDateKey(d)] || "☀️");
+      return days.map((d) => cachedMap[formatDateKey(d)] || defaultSpec);
     }
   } catch (_) {}
 
-  return days.map(() => "");
+  return days.map(() => defaultSpec);
 }
 
 function buildEventLayout(events, days) {
@@ -764,22 +781,45 @@ function buildNativeVectorWidget(days, { grid }, isDirectApi, weatherIcons) {
 
   widget.addSpacer(1);
 
-  // 5. 週間天気アイコン行（日付の真下に7日分の ☀️/⛅️/☁️/🌧️/☔️/⛄️ を中央揃えで配置）
+  // 5. 週間天気アイコン行（Apple純正 SF Symbols ベクター＆高視認ネオンカラー配色）
   const weatherRow = widget.addStack();
   weatherRow.layoutHorizontally();
   weatherRow.centerAlignContent();
-  weatherRow.size = new Size(totalWidth, 13);
+  weatherRow.size = new Size(totalWidth, 14);
 
+  const defaultWeatherSpec = weatherCodeToSpec(0);
   for (let col = 0; col < 7; col++) {
     const wCell = weatherRow.addStack();
     wCell.layoutHorizontally();
     wCell.centerAlignContent();
-    wCell.size = new Size(colW, 13);
+    wCell.size = new Size(colW, 14);
 
-    const icon = (weatherIcons && weatherIcons[col]) ? weatherIcons[col] : "☀️";
-    const wIconTxt = wCell.addText(icon);
-    wIconTxt.font = Font.systemFont(10);
-    wIconTxt.centerAlignText();
+    const wSpec = (weatherIcons && weatherIcons[col] && weatherIcons[col].symbol)
+      ? weatherIcons[col]
+      : defaultWeatherSpec;
+
+    let renderedSymbol = false;
+    if (typeof SFSymbol !== "undefined" && SFSymbol.named) {
+      try {
+        const sym = SFSymbol.named(wSpec.symbol);
+        if (sym && sym.image) {
+          if (sym.applyFont) {
+            sym.applyFont(Font.mediumSystemFont(13));
+          }
+          const img = wCell.addImage(sym.image);
+          img.imageSize = new Size(14, 14);
+          img.tintColor = new Color(wSpec.color);
+          renderedSymbol = true;
+        }
+      } catch (_) {}
+    }
+
+    if (!renderedSymbol) {
+      const wIconTxt = wCell.addText(wSpec.fallback || "☀");
+      wIconTxt.font = Font.boldSystemFont(11);
+      wIconTxt.textColor = new Color(wSpec.color);
+      wIconTxt.centerAlignText();
+    }
 
     if (col < 6) weatherRow.addSpacer(gapX);
   }
