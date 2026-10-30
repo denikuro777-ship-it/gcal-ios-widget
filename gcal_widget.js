@@ -4,8 +4,8 @@
 
 var CONFIG = {
   // ★ 予定の文字サイズ（iOSネイティブベクター文字・ポイント単位）
-  singleLineFontSize: 9.5,
-  twoLineFontSize: 8.5,
+  singleLineFontSize: 9.0,
+  twoLineFontSize: 8.0,
 
   // 1日分の横幅に入る1行あたりの文字数（これを超えると自動で2行目へ折り返し）
   charsPerColLine: 5,
@@ -16,12 +16,16 @@ var CONFIG = {
   // 最大表示段数（2行バーのため3段がベストバランス）
   maxEventRows: 3,
 
-  // レイアウト寸法（iOSネイティブポイント単位：312pt幅）
+  // レイアウト寸法（iOSネイティブポイント単位：312pt幅・週間天気行込みで3段完全収容）
   colWidth: 42,
   colGap: 3,
-  barHeight: 26,
-  barGapY: 3,
+  barHeight: 22,
+  barGapY: 2,
   barCornerRadius: 5,
+
+  // 位置情報未許可・タイムアウト時の初期フォールバック座標（東京）
+  defaultLat: 35.6895,
+  defaultLon: 139.6917,
 
   // 除外カレンダーのFNV-1aハッシュ（RUN'S SC / 誕生日 / Birthdays / Siriからの提案）
   excludeCalendarHashes: [
@@ -85,12 +89,16 @@ async function main() {
   const periodEnd = new Date(days[6]);
   periodEnd.setHours(23, 59, 59, 999);
 
-  const fetchResult = await fetchCalendarEvents(periodStart, periodEnd);
+  // カレンダー予定と現在地の週間天気を並列で高速取得
+  const [fetchResult, weatherIcons] = await Promise.all([
+    fetchCalendarEvents(periodStart, periodEnd),
+    fetchWeeklyWeather(days),
+  ]);
   const rawEvents = fetchResult.events;
   const isDirectApi = fetchResult.isDirectApi;
   const layoutData = buildEventLayout(rawEvents, days);
 
-  const widget = buildNativeVectorWidget(days, layoutData, isDirectApi);
+  const widget = buildNativeVectorWidget(days, layoutData, isDirectApi, weatherIcons);
 
   // OSが許す最短サイクル（1分後）で次回更新をリクエスト
   const nextRefresh = new Date(Date.now() + 60 * 1000);
@@ -400,6 +408,116 @@ async function fetchCalendarEvents(startDate, endDate) {
   return { events: [], isDirectApi: false };
 }
 
+function formatDateKey(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function weatherCodeToEmoji(code) {
+  if (code === undefined || code === null) return "☀️";
+  const c = Number(code);
+  if (c === 0 || c === 1) return "☀️";
+  if (c === 2) return "⛅️";
+  if (c === 3 || c === 45 || c === 48) return "☁️";
+  if ((c >= 51 && c <= 63) || c === 80 || c === 81) return "🌧️";
+  if ((c >= 65 && c <= 67) || c === 82 || (c >= 95 && c <= 99)) return "☔️";
+  if ((c >= 71 && c <= 77) || c === 85 || c === 86) return "⛄️";
+  return "☁️";
+}
+
+async function getCurrentCoordinates() {
+  const { fm, path } = getLocalCachePath("gcal_location_cache.json");
+  let cachedLoc = null;
+  if (fm.fileExists(path)) {
+    try {
+      cachedLoc = JSON.parse(fm.readString(path));
+    } catch (_) {}
+  }
+
+  // バックグラウンドウィジェット実行時はキャッシュがあれば即時利用（位置情報タイムアウトによる描画停止を防止）
+  if (
+    cachedLoc &&
+    cachedLoc.latitude &&
+    cachedLoc.longitude &&
+    (config.runsInWidget || (cachedLoc.updatedAt && Date.now() - cachedLoc.updatedAt < 30 * 60 * 1000))
+  ) {
+    return { latitude: cachedLoc.latitude, longitude: cachedLoc.longitude };
+  }
+
+  try {
+    if (typeof Location !== "undefined" && Location.current) {
+      if (Location.setAccuracyToThreeKilometers) {
+        Location.setAccuracyToThreeKilometers();
+      } else if (Location.setAccuracyToKilometer) {
+        Location.setAccuracyToKilometer();
+      }
+      const locPromise = Location.current();
+      let loc = null;
+      if (typeof Timer !== "undefined" && Timer.schedule) {
+        const timeoutPromise = new Promise((resolve) => {
+          Timer.schedule(2500, false, () => resolve(null));
+        });
+        loc = await Promise.race([locPromise, timeoutPromise]);
+      } else {
+        loc = await locPromise;
+      }
+      if (loc && loc.latitude && loc.longitude) {
+        try {
+          fm.writeString(
+            path,
+            JSON.stringify({
+              latitude: loc.latitude,
+              longitude: loc.longitude,
+              updatedAt: Date.now(),
+            })
+          );
+        } catch (_) {}
+        return { latitude: loc.latitude, longitude: loc.longitude };
+      }
+    }
+  } catch (_) {}
+
+  if (cachedLoc && cachedLoc.latitude && cachedLoc.longitude) {
+    return { latitude: cachedLoc.latitude, longitude: cachedLoc.longitude };
+  }
+  return { latitude: CONFIG.defaultLat, longitude: CONFIG.defaultLon };
+}
+
+async function fetchWeeklyWeather(days) {
+  const { fm, path } = getLocalCachePath("gcal_weather_cache.json");
+  try {
+    const coords = await getCurrentCoordinates();
+    const url =
+      `https://api.open-meteo.com/v1/forecast` +
+      `?latitude=${coords.latitude}&longitude=${coords.longitude}` +
+      `&daily=weather_code&timezone=Asia%2FTokyo&forecast_days=8`;
+    const req = new Request(url);
+    req.timeoutInterval = 5;
+    const res = await req.loadJSON();
+    if (res && res.daily && Array.isArray(res.daily.time) && Array.isArray(res.daily.weather_code)) {
+      const weatherMap = {};
+      for (let i = 0; i < res.daily.time.length; i++) {
+        weatherMap[res.daily.time[i]] = weatherCodeToEmoji(res.daily.weather_code[i]);
+      }
+      try {
+        fm.writeString(path, JSON.stringify(weatherMap));
+      } catch (_) {}
+      return days.map((d) => weatherMap[formatDateKey(d)] || "☀️");
+    }
+  } catch (_) {}
+
+  try {
+    if (fm.fileExists(path)) {
+      const cachedMap = JSON.parse(fm.readString(path));
+      return days.map((d) => cachedMap[formatDateKey(d)] || "☀️");
+    }
+  } catch (_) {}
+
+  return days.map(() => "");
+}
+
 function buildEventLayout(events, days) {
   const dayStartMs = days.map((d) => d.getTime());
   const dayEndMs = days.map((d) => {
@@ -514,11 +632,11 @@ function getRunScriptUrl() {
   return base + sep + "action=refresh";
 }
 
-function buildNativeVectorWidget(days, { grid }, isDirectApi) {
+function buildNativeVectorWidget(days, { grid }, isDirectApi, weatherIcons) {
   const widget = new ListWidget();
   widget.backgroundColor = new Color(CONFIG.bgColor);
   widget.url = CONFIG.tapUrl;
-  widget.setPadding(8, 10, 8, 10);
+  widget.setPadding(6, 10, 6, 10);
 
   const colW = CONFIG.colWidth;
   const gapX = CONFIG.colGap;
@@ -529,11 +647,11 @@ function buildNativeVectorWidget(days, { grid }, isDirectApi) {
   const headerRow = widget.addStack();
   headerRow.layoutHorizontally();
   headerRow.centerAlignContent();
-  headerRow.size = new Size(totalWidth, 18);
+  headerRow.size = new Size(totalWidth, 16);
 
   const firstMonth = days[0].getMonth() + 1;
   const monthTxt = headerRow.addText(`${firstMonth}月`);
-  monthTxt.font = Font.boldSystemFont(14);
+  monthTxt.font = Font.boldSystemFont(13);
   monthTxt.textColor = new Color(CONFIG.monthTextColor);
 
   headerRow.addSpacer();
@@ -542,12 +660,12 @@ function buildNativeVectorWidget(days, { grid }, isDirectApi) {
   const refreshBtn = headerRow.addStack();
   refreshBtn.layoutHorizontally();
   refreshBtn.centerAlignContent();
-  refreshBtn.size = new Size(28, 17);
+  refreshBtn.size = new Size(28, 16);
   refreshBtn.cornerRadius = 8;
   refreshBtn.backgroundColor = new Color(CONFIG.refreshBtnBg);
   refreshBtn.url = getRunScriptUrl();
   const refreshTxt = refreshBtn.addText("↻");
-  refreshTxt.font = Font.boldSystemFont(12);
+  refreshTxt.font = Font.boldSystemFont(11.5);
   refreshTxt.textColor = new Color(isDirectApi ? CONFIG.plusColor : CONFIG.refreshBtnText);
   refreshTxt.centerAlignText();
 
@@ -557,57 +675,57 @@ function buildNativeVectorWidget(days, { grid }, isDirectApi) {
   const plusBtn = headerRow.addStack();
   plusBtn.layoutHorizontally();
   plusBtn.centerAlignContent();
-  plusBtn.size = new Size(20, 17);
+  plusBtn.size = new Size(20, 16);
   plusBtn.url = CONFIG.tapUrl;
   const plusTxt = plusBtn.addText("＋");
-  plusTxt.font = Font.mediumSystemFont(15);
+  plusTxt.font = Font.mediumSystemFont(14);
   plusTxt.textColor = new Color(CONFIG.plusColor);
   plusTxt.centerAlignText();
 
-  widget.addSpacer(2);
+  widget.addSpacer(1);
 
   // 2. 曜日行（addSpacerを使わず colW の横幅を100%使って中央揃え）
   const weekdayRow = widget.addStack();
   weekdayRow.layoutHorizontally();
-  weekdayRow.size = new Size(totalWidth, 13);
+  weekdayRow.size = new Size(totalWidth, 11);
   weekdayRow.url = CONFIG.tapUrl;
 
   for (let col = 0; col < 7; col++) {
     const cell = weekdayRow.addStack();
     cell.layoutHorizontally();
     cell.centerAlignContent();
-    cell.size = new Size(colW, 13);
+    cell.size = new Size(colW, 11);
 
     const dow = days[col].getDay();
     const wTxt = cell.addText(WEEKDAYS_JP[dow]);
-    wTxt.font = Font.mediumSystemFont(9.5);
+    wTxt.font = Font.mediumSystemFont(9);
     wTxt.textColor = new Color(CONFIG.weekdayTextColor);
     wTxt.centerAlignText();
 
     if (col < 6) weekdayRow.addSpacer(gapX);
   }
 
-  widget.addSpacer(2);
+  widget.addSpacer(1);
 
   // 3. 区切り線
   const divider = widget.addStack();
   divider.size = new Size(totalWidth, 1);
   divider.backgroundColor = new Color(CONFIG.dividerColor);
 
-  widget.addSpacer(3);
+  widget.addSpacer(2);
 
   // 4. 日付行（白丸の「30」が潰れないよう addSpacer を排除し Size + centerAlignContent で中央配置）
   const dateRow = widget.addStack();
   dateRow.layoutHorizontally();
   dateRow.centerAlignContent();
-  dateRow.size = new Size(totalWidth, 20);
+  dateRow.size = new Size(totalWidth, 18);
   dateRow.url = CONFIG.tapUrl;
 
   for (let col = 0; col < 7; col++) {
     const cell = dateRow.addStack();
     cell.layoutHorizontally();
     cell.centerAlignContent();
-    cell.size = new Size(colW, 20);
+    cell.size = new Size(colW, 18);
 
     const d = days[col];
     const dow = d.getDay();
@@ -626,17 +744,17 @@ function buildNativeVectorWidget(days, { grid }, isDirectApi) {
       const circle = cell.addStack();
       circle.layoutHorizontally();
       circle.centerAlignContent();
-      circle.size = new Size(20, 20);
-      circle.cornerRadius = 10;
+      circle.size = new Size(18, 18);
+      circle.cornerRadius = 9;
       circle.backgroundColor = new Color(CONFIG.todayCircleColor);
 
       const dTxt = circle.addText(String(d.getDate()));
-      dTxt.font = Font.boldSystemFont(11);
+      dTxt.font = Font.boldSystemFont(10.5);
       dTxt.textColor = new Color(textColor);
       dTxt.centerAlignText();
     } else {
       const dTxt = cell.addText(String(d.getDate()));
-      dTxt.font = Font.regularSystemFont(11);
+      dTxt.font = Font.regularSystemFont(10.5);
       dTxt.textColor = new Color(textColor);
       dTxt.centerAlignText();
     }
@@ -644,9 +762,31 @@ function buildNativeVectorWidget(days, { grid }, isDirectApi) {
     if (col < 6) dateRow.addSpacer(gapX);
   }
 
-  widget.addSpacer(4);
+  widget.addSpacer(1);
 
-  // 5. 予定バー行（addSpacerによる横幅侵食をゼロにしつつ、各行を horizontal Stack + size(barW) で完全中央揃え）
+  // 5. 週間天気アイコン行（日付の真下に7日分の ☀️/⛅️/☁️/🌧️/☔️/⛄️ を中央揃えで配置）
+  const weatherRow = widget.addStack();
+  weatherRow.layoutHorizontally();
+  weatherRow.centerAlignContent();
+  weatherRow.size = new Size(totalWidth, 13);
+
+  for (let col = 0; col < 7; col++) {
+    const wCell = weatherRow.addStack();
+    wCell.layoutHorizontally();
+    wCell.centerAlignContent();
+    wCell.size = new Size(colW, 13);
+
+    const icon = (weatherIcons && weatherIcons[col]) ? weatherIcons[col] : "☀️";
+    const wIconTxt = wCell.addText(icon);
+    wIconTxt.font = Font.systemFont(10);
+    wIconTxt.centerAlignText();
+
+    if (col < 6) weatherRow.addSpacer(gapX);
+  }
+
+  widget.addSpacer(2);
+
+  // 6. 予定バー行（addSpacerによる横幅侵食をゼロにしつつ、各行を horizontal Stack + size(barW) で完全中央揃え）
   for (let r = 0; r < CONFIG.maxEventRows; r++) {
     const rowCells = grid[r] || [null, null, null, null, null, null, null];
     const evRow = widget.addStack();
@@ -695,7 +835,7 @@ function buildNativeVectorWidget(days, { grid }, isDirectApi) {
             const lineRow = bar.addStack();
             lineRow.layoutHorizontally();
             lineRow.centerAlignContent();
-            lineRow.size = new Size(barW, 12);
+            lineRow.size = new Size(barW, 10);
 
             const t = lineRow.addText(lines[i]);
             t.font = Font.boldSystemFont(CONFIG.twoLineFontSize);
