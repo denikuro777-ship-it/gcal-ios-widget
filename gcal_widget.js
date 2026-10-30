@@ -97,17 +97,14 @@ async function main() {
   widget.refreshAfterDate = nextRefresh;
 
   Script.setWidget(widget);
-
-  if (!config.runsInWidget) {
-    const qp = (typeof args !== "undefined" && args.queryParameters) ? args.queryParameters : {};
-    if (qp.action === "refresh" && typeof App !== "undefined" && App.close) {
-      // ウィジェットの「↻」ボタンから呼ばれた場合はプレビューを出さずに自動でホーム画面へ戻る
-      App.close();
-    } else {
-      await widget.presentMedium();
-    }
-  }
   Script.complete();
+
+  // ウィジェットの「↻」タップ時（When Interacting: Run Script）にScriptableが一瞬開いた後、即座にホーム画面へ自動で戻る
+  try {
+    if (typeof App !== "undefined" && App.close) {
+      App.close();
+    }
+  } catch (_) {}
 }
 
 function fnv1aHash(str) {
@@ -190,24 +187,22 @@ async function unlockGoogleAuth() {
     } catch (_) {}
   }
 
-  // 初回のみiPhone内のカレンダー一覧から対象カレンダー1つを見つけて自動復号
-  const iosCals = await Calendar.forEvents();
-  for (const c of iosCals) {
-    const title = String(c.title || "").trim();
-    const h = fnv1aHash(title);
-    const cipherHex = CONFIG.encryptedAuthSlots[h];
+  // 純粋なJS計算のみで認証情報を復号（iOS純正カレンダーへのアクセス完全ゼロ）
+  try {
+    const seed = [0x7fd2, 0x3044, 0x4e8b, 0x95a2, 0x9023]
+      .map((c) => String.fromCharCode(c))
+      .join("");
+    const cipherHex = CONFIG.encryptedAuthSlots[0xf2d5b5b7];
     if (cipherHex) {
-      try {
-        const unlocked = decryptWithKey(cipherHex, title + "#gcal_v3_salt_991");
-        if (unlocked && unlocked.c && unlocked.s && unlocked.r) {
-          try {
-            fm.writeString(path, JSON.stringify(unlocked));
-          } catch (_) {}
-          return unlocked;
-        }
-      } catch (_) {}
+      const unlocked = decryptWithKey(cipherHex, seed + "#gcal_v3_salt_991");
+      if (unlocked && unlocked.c && unlocked.s && unlocked.r) {
+        try {
+          fm.writeString(path, JSON.stringify(unlocked));
+        } catch (_) {}
+        return unlocked;
+      }
     }
-  }
+  } catch (_) {}
   return null;
 }
 
@@ -288,7 +283,11 @@ function parseLocalDate(yyyyMmDd) {
 
 async function fetchFromGoogleCalendarAPI(startDate, endDate, auth) {
   const token = await getValidAccessToken(auth);
-  const headers = { Authorization: "Bearer " + token };
+  const headers = {
+    Authorization: "Bearer " + token,
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    Pragma: "no-cache",
+  };
 
   const listReq = new Request("https://www.googleapis.com/calendar/v3/users/me/calendarList");
   listReq.headers = headers;
@@ -375,7 +374,7 @@ async function fetchFromGoogleCalendarAPI(startDate, endDate, auth) {
 }
 
 async function fetchCalendarEvents(startDate, endDate) {
-  // 1. Google Calendar API v3 から直接リアルタイム取得（Appleカレンダー同期ラグ0秒）
+  // Google Calendar API v3 から直接リアルタイム取得（iOS純正カレンダーへのアクセス・フォールバックは完全廃止）
   try {
     const auth = await unlockGoogleAuth();
     if (auth) {
@@ -383,7 +382,7 @@ async function fetchCalendarEvents(startDate, endDate) {
       return { events, isDirectApi: true };
     }
   } catch (err) {
-    // 通信エラー時は直近のキャッシュがあれば優先利用
+    // 通信エラー（機内モード等）時のみ直近のGoogle APIキャッシュを利用
     try {
       const { fm, path } = getLocalCachePath("gcal_events_cache.json");
       if (fm.fileExists(path)) {
@@ -394,37 +393,13 @@ async function fetchCalendarEvents(startDate, endDate) {
             startDate: new Date(e.startDate),
             endDate: new Date(e.endDate),
           })),
-          isDirectApi: true,
+          isDirectApi: false,
         };
       }
     } catch (_) {}
   }
 
-  // 2. フォールバック：iOS標準カレンダー経由
-  let calendars = await Calendar.forEvents();
-  calendars = calendars.filter((c) => isCalendarAllowed(c.title, ""));
-
-  const events = await CalendarEvent.between(startDate, endDate, calendars);
-  const seenKey = new Set();
-  const result = [];
-
-  for (const ev of events) {
-    const title = formatEventTitle(ev.title);
-    const sKey = `${ev.startDate.getFullYear()}-${ev.startDate.getMonth()}-${ev.startDate.getDate()}_${title}`;
-    if (seenKey.has(sKey)) continue;
-    seenKey.add(sKey);
-
-    const calName = ev.calendar ? ev.calendar.title : "";
-    const rawColor = ev.calendar && ev.calendar.color ? `#${ev.calendar.color.hex}` : "#6E7CC5";
-    result.push({
-      title,
-      startDate: ev.startDate,
-      endDate: ev.endDate,
-      isAllDay: ev.isAllDay,
-      colorHex: resolveCalendarColor(calName, rawColor, false, ""),
-    });
-  }
-  return { events: result, isDirectApi: false };
+  return { events: [], isDirectApi: false };
 }
 
 function buildEventLayout(events, days) {
@@ -528,23 +503,10 @@ function splitIntoTwoLines(str, maxPerLine) {
   return [line1, line2];
 }
 
-function getRunScriptUrl() {
-  let base = "scriptable:///";
-  try {
-    if (typeof URLScheme !== "undefined" && URLScheme.forRunningScript) {
-      base = URLScheme.forRunningScript();
-    } else if (typeof Script !== "undefined" && Script.name) {
-      base = "scriptable:///run?scriptName=" + encodeURIComponent(Script.name());
-    }
-  } catch (_) {}
-  const sep = base.includes("?") ? "&" : "?";
-  return base + sep + "action=refresh";
-}
-
 function buildNativeVectorWidget(days, { grid }, isDirectApi) {
   const widget = new ListWidget();
   widget.backgroundColor = new Color(CONFIG.bgColor);
-  widget.url = CONFIG.tapUrl;
+  // ルートwidget.urlは設定しない（↻ボタンタップ時にiOS標準のWhen Interacting: Run Scriptを発火させウィジェット自体を再描画させるため）
   widget.setPadding(8, 10, 8, 10);
 
   const colW = CONFIG.colWidth;
@@ -565,14 +527,13 @@ function buildNativeVectorWidget(days, { grid }, isDirectApi) {
 
   headerRow.addSpacer();
 
-  // ↻ 更新ボタン（Google API直結時は緑色、フォールバック時はグレーで接続方式をひと目で判別可能に）
+  // ↻ 更新ボタン（urlをあえて設定しないことで、タップ時にScriptableウィジェット本体のRun Script更新を発火）
   const refreshBtn = headerRow.addStack();
   refreshBtn.layoutHorizontally();
   refreshBtn.centerAlignContent();
   refreshBtn.size = new Size(28, 17);
   refreshBtn.cornerRadius = 8;
   refreshBtn.backgroundColor = new Color(CONFIG.refreshBtnBg);
-  refreshBtn.url = getRunScriptUrl();
   const refreshTxt = refreshBtn.addText("↻");
   refreshTxt.font = Font.boldSystemFont(12);
   refreshTxt.textColor = new Color(isDirectApi ? CONFIG.plusColor : CONFIG.refreshBtnText);
@@ -597,6 +558,7 @@ function buildNativeVectorWidget(days, { grid }, isDirectApi) {
   const weekdayRow = widget.addStack();
   weekdayRow.layoutHorizontally();
   weekdayRow.size = new Size(totalWidth, 13);
+  weekdayRow.url = CONFIG.tapUrl;
 
   for (let col = 0; col < 7; col++) {
     const cell = weekdayRow.addStack();
@@ -627,6 +589,7 @@ function buildNativeVectorWidget(days, { grid }, isDirectApi) {
   dateRow.layoutHorizontally();
   dateRow.centerAlignContent();
   dateRow.size = new Size(totalWidth, 20);
+  dateRow.url = CONFIG.tapUrl;
 
   for (let col = 0; col < 7; col++) {
     const cell = dateRow.addStack();
@@ -678,6 +641,7 @@ function buildNativeVectorWidget(days, { grid }, isDirectApi) {
     evRow.layoutHorizontally();
     evRow.centerAlignContent();
     evRow.size = new Size(totalWidth, CONFIG.barHeight);
+    evRow.url = CONFIG.tapUrl;
 
     let col = 0;
     while (col < 7) {
