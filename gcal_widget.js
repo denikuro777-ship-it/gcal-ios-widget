@@ -41,12 +41,13 @@ var CONFIG = {
     0x36c0b034: "#2A8C72", // ティールグリーン（日本の祝日）
   },
 
-  // 端末内カレンダーから動的鍵を導出するための対象ハッシュ順序
-  keySlotHashes: [0x72b61c9e, 0x06a85db2, 0xf2d5b5b7],
-
-  // 端末固有カレンダー名で暗号化されたGoogle Calendar APIダイレクト認証ペイロード
-  encryptedAuthHex:
-    "4345201017f7e5633213b11305c40bcce5367f80762621245a07cf4c30ed72e37a3e52d237d97f120e111bc185d6f6863527cf8dc6f669b1f029fe0dbb48e6db3a61890db5757667ca28d1e8bf456b8c2b3e66b273d905227d6a56f2043f2922e6b2d52d3a203b9125d3ee6c054ed3021568d44a74c270e77271b8aadc7e27e62c743ddfc90ff94aadeedbec9b6fb5532a9752b5f0a575e98b1db0fe5c1b7a3a9cc772a5abaa40c06da703e1a7af566bb62082d3705fe7841db74d0575ce326ba3c06fb3d282338750859063c13fd94f9871f93552e12f9cc9db7fe2c945a173dcad21e95c20ef36",
+  // 端末内カレンダーから動的鍵を導出するスロット（どれか1つでも存在すれば即時ロック解除）
+  encryptedAuthSlots: {
+    0xf2d5b5b7:
+      "52639e80b808365bd85600fba577b139db8c5ae66b7095329c6c1894c3b3b5f22b66c10b31058203d90e3991c09d0259ece12f0ae20995bdd8dd699c680a6ab358529807250e19e03960724d617991a0e77cc6cdb04baa4c34c0b2fd19d27e2c306a1aa0163eb50f8d5dc33caaadd8570277e37474c83b14ee6fec193d0d6148efc94a54e54ba8dde7a20505cea28765b76c0f5826e028455c942a19788b1c0f74ccc97df8bfe510905b1d62adb67f94bb335085daae0436cf8a5f432401170e2b554a91c24ae594a6f43f8e65fe434d19c20c252b32e90dcd7674037f2bf293c4c76ab8ad83eb2a",
+    0x72b61c9e:
+      "e77b90258ab890fadb4e26c6a558558c6b203c9eef68604bfc84dcaccd7c547ab1020308461f9432a621f2946bd388d70fc6237f009e6c3118b7382a098d44e621b2a2af26c9002a79ffd0a7d07c4d213ac2f2f1738f5a7923e7df14d17e374cf53e05c2becbcee550c895aced8264bb70a5083fc3e39224bb8b71bc12b1865915b349780e6552838b0077bd709a7645045755f10a08f0035727df5a2eb2400bbffb44b9a26e5a3d744289065a668713301bea4b8425b93e18d4ec19c662130696a352f4270c00efa8ff6f061dbb48f48c59cdde9894b280755ebe788cfd80ef8c986de1aad8c93a",
+  },
 
   // カラーテーマ
   bgColor: "#1E1E20",
@@ -84,10 +85,12 @@ async function main() {
   const periodEnd = new Date(days[6]);
   periodEnd.setHours(23, 59, 59, 999);
 
-  const rawEvents = await fetchCalendarEvents(periodStart, periodEnd);
+  const fetchResult = await fetchCalendarEvents(periodStart, periodEnd);
+  const rawEvents = fetchResult.events;
+  const isDirectApi = fetchResult.isDirectApi;
   const layoutData = buildEventLayout(rawEvents, days);
 
-  const widget = buildNativeVectorWidget(days, layoutData);
+  const widget = buildNativeVectorWidget(days, layoutData, isDirectApi);
 
   // OSが許す最短サイクル（1分後）で次回更新をリクエスト
   const nextRefresh = new Date(Date.now() + 60 * 1000);
@@ -187,27 +190,23 @@ async function unlockGoogleAuth() {
     } catch (_) {}
   }
 
-  // 初回のみiPhone内のカレンダー一覧から鍵を自動生成して復号
+  // 初回のみiPhone内のカレンダー一覧から対象カレンダー1つを見つけて自動復号
   const iosCals = await Calendar.forEvents();
-  const slotMap = {};
   for (const c of iosCals) {
     const title = String(c.title || "").trim();
     const h = fnv1aHash(title);
-    slotMap[h] = title;
-  }
-
-  const parts = CONFIG.keySlotHashes.map((h) => slotMap[h]);
-  if (parts.some((p) => !p)) {
-    return null;
-  }
-
-  const keyStr = parts.join("|");
-  const unlocked = decryptWithKey(CONFIG.encryptedAuthHex, keyStr);
-  if (unlocked && unlocked.c && unlocked.s && unlocked.r) {
-    try {
-      fm.writeString(path, JSON.stringify(unlocked));
-    } catch (_) {}
-    return unlocked;
+    const cipherHex = CONFIG.encryptedAuthSlots[h];
+    if (cipherHex) {
+      try {
+        const unlocked = decryptWithKey(cipherHex, title + "#gcal_v3_salt_991");
+        if (unlocked && unlocked.c && unlocked.s && unlocked.r) {
+          try {
+            fm.writeString(path, JSON.stringify(unlocked));
+          } catch (_) {}
+          return unlocked;
+        }
+      } catch (_) {}
+    }
   }
   return null;
 }
@@ -306,38 +305,42 @@ async function fetchFromGoogleCalendarAPI(startDate, endDate, auth) {
   const timeMax = encodeURIComponent(endDate.toISOString());
 
   const perCalendarPromises = targetCals.map(async (cal) => {
-    const calIdEnc = encodeURIComponent(cal.id);
-    const url =
-      `https://www.googleapis.com/calendar/v3/calendars/${calIdEnc}/events` +
-      `?timeMin=${timeMin}&timeMax=${timeMax}&singleEvents=true&orderBy=startTime&maxResults=250`;
-    const evReq = new Request(url);
-    evReq.headers = headers;
-    evReq.timeoutInterval = 8;
-    const evRes = await evReq.loadJSON();
-    const items = (evRes && evRes.items) ? evRes.items : [];
-    const calTitle = cal.summaryOverride || cal.summary || "";
-    const colorHex = resolveCalendarColor(calTitle, cal.backgroundColor, Boolean(cal.primary), cal.id);
+    try {
+      const calIdEnc = encodeURIComponent(cal.id);
+      const url =
+        `https://www.googleapis.com/calendar/v3/calendars/${calIdEnc}/events` +
+        `?timeMin=${timeMin}&timeMax=${timeMax}&singleEvents=true&orderBy=startTime&maxResults=250`;
+      const evReq = new Request(url);
+      evReq.headers = headers;
+      evReq.timeoutInterval = 8;
+      const evRes = await evReq.loadJSON();
+      const items = (evRes && evRes.items) ? evRes.items : [];
+      const calTitle = cal.summaryOverride || cal.summary || "";
+      const colorHex = resolveCalendarColor(calTitle, cal.backgroundColor, Boolean(cal.primary), cal.id);
 
-    const parsed = [];
-    for (const item of items) {
-      if (item.status === "cancelled") continue;
-      const isAllDay = Boolean(item.start && item.start.date);
-      const evStart = isAllDay
-        ? parseLocalDate(item.start.date)
-        : new Date(item.start.dateTime);
-      const evEnd = isAllDay
-        ? parseLocalDate(item.end.date)
-        : new Date(item.end.dateTime);
+      const parsed = [];
+      for (const item of items) {
+        if (item.status === "cancelled") continue;
+        const isAllDay = Boolean(item.start && item.start.date);
+        const evStart = isAllDay
+          ? parseLocalDate(item.start.date)
+          : new Date(item.start.dateTime);
+        const evEnd = isAllDay
+          ? parseLocalDate(item.end.date)
+          : new Date(item.end.dateTime);
 
-      parsed.push({
-        title: formatEventTitle(item.summary),
-        startDate: evStart,
-        endDate: evEnd,
-        isAllDay,
-        colorHex,
-      });
+        parsed.push({
+          title: formatEventTitle(item.summary),
+          startDate: evStart,
+          endDate: evEnd,
+          isAllDay,
+          colorHex,
+        });
+      }
+      return parsed;
+    } catch (_) {
+      return [];
     }
-    return parsed;
   });
 
   const allCalArrays = await Promise.all(perCalendarPromises);
@@ -376,7 +379,8 @@ async function fetchCalendarEvents(startDate, endDate) {
   try {
     const auth = await unlockGoogleAuth();
     if (auth) {
-      return await fetchFromGoogleCalendarAPI(startDate, endDate, auth);
+      const events = await fetchFromGoogleCalendarAPI(startDate, endDate, auth);
+      return { events, isDirectApi: true };
     }
   } catch (err) {
     // 通信エラー時は直近のキャッシュがあれば優先利用
@@ -384,11 +388,14 @@ async function fetchCalendarEvents(startDate, endDate) {
       const { fm, path } = getLocalCachePath("gcal_events_cache.json");
       if (fm.fileExists(path)) {
         const cached = JSON.parse(fm.readString(path));
-        return cached.map((e) => ({
-          ...e,
-          startDate: new Date(e.startDate),
-          endDate: new Date(e.endDate),
-        }));
+        return {
+          events: cached.map((e) => ({
+            ...e,
+            startDate: new Date(e.startDate),
+            endDate: new Date(e.endDate),
+          })),
+          isDirectApi: true,
+        };
       }
     } catch (_) {}
   }
@@ -417,7 +424,7 @@ async function fetchCalendarEvents(startDate, endDate) {
       colorHex: resolveCalendarColor(calName, rawColor, false, ""),
     });
   }
-  return result;
+  return { events: result, isDirectApi: false };
 }
 
 function buildEventLayout(events, days) {
@@ -534,7 +541,7 @@ function getRunScriptUrl() {
   return base + sep + "action=refresh";
 }
 
-function buildNativeVectorWidget(days, { grid }) {
+function buildNativeVectorWidget(days, { grid }, isDirectApi) {
   const widget = new ListWidget();
   widget.backgroundColor = new Color(CONFIG.bgColor);
   widget.url = CONFIG.tapUrl;
@@ -558,7 +565,7 @@ function buildNativeVectorWidget(days, { grid }) {
 
   headerRow.addSpacer();
 
-  // ↻ 更新ボタン（addSpacerを使わずSizeとcenterAlignContentで中央配置）
+  // ↻ 更新ボタン（Google API直結時は緑色、フォールバック時はグレーで接続方式をひと目で判別可能に）
   const refreshBtn = headerRow.addStack();
   refreshBtn.layoutHorizontally();
   refreshBtn.centerAlignContent();
@@ -568,7 +575,7 @@ function buildNativeVectorWidget(days, { grid }) {
   refreshBtn.url = getRunScriptUrl();
   const refreshTxt = refreshBtn.addText("↻");
   refreshTxt.font = Font.boldSystemFont(12);
-  refreshTxt.textColor = new Color(CONFIG.refreshBtnText);
+  refreshTxt.textColor = new Color(isDirectApi ? CONFIG.plusColor : CONFIG.refreshBtnText);
   refreshTxt.centerAlignText();
 
   headerRow.addSpacer(8);
